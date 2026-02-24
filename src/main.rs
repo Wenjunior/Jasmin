@@ -28,10 +28,12 @@ use std::{
 	},
 	collections::HashMap
 };
+use clap::{
+	Parser,
+	ArgAction
+};
 
-const PORT: u16 = 80;
 const CAPACITY: usize = 128;
-const BASE_DIR: &str = "static";
 const REQUEST_SIZE: usize = 1024;
 const SERVER_TOKEN: Token = Token(0);
 
@@ -40,18 +42,42 @@ struct Session {
 	response: Option<Vec<u8>>
 }
 
+#[derive(Parser)]
+#[command(disable_help_flag = true, version, disable_version_flag = true)]
+struct Args {
+	#[arg(short, action = ArgAction::Help, hide = true)]
+	help: Option<bool>,
+
+	#[arg(short, action = ArgAction::Version, help = "Show version")]
+	version: Option<bool>,
+
+	#[arg(short, default_value_t = 80, help = "Runs on the specified port")]
+	port: u16,
+
+	#[arg(short, default_value = "static", help = "Serve the directory files")]
+	base_dir: String
+}
+
 fn main() {
-	if let Err(error) = run_server() {
-		eprintln!("{}", error);
+	let args = Args::parse();
+
+	if let Err(error) = run_server(args.port, args.base_dir) {
+		if permission_denied(&error) {
+			eprintln!("Permission denied, you need administrator privileges.");
+
+			return;
+		}
+
+		eprintln!("Unknown error: {}", error);
 	}
 }
 
-fn run_server() -> Result<(), Error> {
+fn run_server(port: u16, base_dir: String) -> Result<(), Error> {
 	let mut poll = Poll::new()?;
 
 	let mut events = Events::with_capacity(CAPACITY);
 
-	let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), PORT);
+	let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
 
 	let mut server = TcpListener::bind(address)?;
 
@@ -61,6 +87,8 @@ fn run_server() -> Result<(), Error> {
 	let mut next_client_id: usize = 1;
 
 	let mut sessions: HashMap<usize, Session> = HashMap::new();
+
+	println!("Running on: 0.0.0.0:{}", port);
 
 	loop {
 		if let Err(error) = poll.poll(&mut events, None) {
@@ -83,7 +111,7 @@ fn run_server() -> Result<(), Error> {
 					}
 				},
 				Token(client_id) => {
-					if let Err(_) = handle_client(&mut sessions, client_id, &event, &poll) {
+					if let Err(_) = handle_client(&mut sessions, client_id, &event, &poll, base_dir.clone()) {
 						close_client(&mut sessions, client_id, &poll);
 					}
 				}
@@ -116,7 +144,7 @@ fn would_block(error: &Error) -> bool {
 	error.kind() == ErrorKind::WouldBlock
 }
 
-fn handle_client(sessions: &mut HashMap<usize, Session>, client_id: usize, event: &Event, poll: &Poll) -> Result<(), Error> {
+fn handle_client(sessions: &mut HashMap<usize, Session>, client_id: usize, event: &Event, poll: &Poll, base_dir: String) -> Result<(), Error> {
 	if let Some(session) = sessions.get_mut(&client_id) {
 		if event.is_readable() {
 			let mut data = vec![0; REQUEST_SIZE];
@@ -154,7 +182,7 @@ fn handle_client(sessions: &mut HashMap<usize, Session>, client_id: usize, event
 			poll.registry()
 				.reregister(&mut session.client, Token(client_id), Interest::WRITABLE)?;
 
-			let response = handle_request(data);
+			let response = handle_request(data, base_dir);
 
 			session.response = Some(response);
 
@@ -177,7 +205,7 @@ fn handle_client(sessions: &mut HashMap<usize, Session>, client_id: usize, event
 	Ok(())
 }
 
-fn handle_request(data: Vec<u8>) -> Vec<u8> {
+fn handle_request(data: Vec<u8>, base_dir: String) -> Vec<u8> {
 	let path = match parse_request(data) {
 		Ok(path) => path,
 		Err(_) => {
@@ -185,7 +213,7 @@ fn handle_request(data: Vec<u8>) -> Vec<u8> {
 		}
 	};
 
-	let full_path = match prevent_directory_transversal(path.clone()) {
+	let full_path = match prevent_directory_transversal(base_dir, path.clone()) {
 		Ok(full_path) => full_path,
 		Err(error) => {
 			if permission_denied(&error) {
@@ -267,8 +295,8 @@ fn build_response(status: &str, headers: HashMap<&str, &str>, mut body: Vec<u8>)
 	response
 }
 
-fn prevent_directory_transversal(mut path: String) -> Result<PathBuf, Error> {
-	let base_path = Path::new(BASE_DIR)
+fn prevent_directory_transversal(base_dir: String, mut path: String) -> Result<PathBuf, Error> {
+	let base_path = Path::new(&base_dir)
 		.canonicalize()?;
 
 	path = path.trim_start_matches('/')
@@ -307,7 +335,7 @@ fn get_content(full_path: PathBuf, path: String) -> Result<Vec<u8>, Error> {
 		return Ok(content);
 	}
 
-	let title = format!("Listing: {}", path);
+	let title = format!("Index of: {}", path);
 
 	let entries: Vec<String> = fs::read_dir(full_path)?.filter_map(|entry| {
 		let entry = entry.ok()?;
@@ -320,7 +348,7 @@ fn get_content(full_path: PathBuf, path: String) -> Result<Vec<u8>, Error> {
 	let mut tags = entries.iter()
 		.map(|entry| format!("<a href=\"{}\">{}</a>", format!("{}/{}", path, entry), entry))
 			.collect::<Vec<_>>()
-				.join("\n\t\t\t");
+				.join("\n\n\t\t\t<br/>\n\n\t\t\t");
 
 	if tags.is_empty() {
 		tags = String::from("<p>It's empty.</p>");

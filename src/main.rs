@@ -11,11 +11,12 @@ use mio::{
 };
 use std::{
 	fs,
+	time,
 	io::{
 		Read,
 		Error,
 		Write,
-		ErrorKind,
+		ErrorKind
 	},
 	net::{
 		IpAddr,
@@ -26,6 +27,7 @@ use std::{
 		Path,
 		PathBuf
 	},
+	sync::Arc,
 	collections::HashMap
 };
 use clap::{
@@ -40,6 +42,11 @@ const SERVER_TOKEN: Token = Token(0);
 struct Session {
 	client: TcpStream,
 	response: Option<Vec<u8>>
+}
+
+struct Cache {
+	content: Arc<Vec<u8>>,
+	modified_timestamp: u64
 }
 
 #[derive(Parser)]
@@ -88,6 +95,8 @@ fn run_server(port: u16, base_dir: String) -> Result<(), Error> {
 
 	let mut sessions: HashMap<usize, Session> = HashMap::new();
 
+	let mut caches: HashMap<PathBuf, Cache> = HashMap::new();
+
 	println!("Running on: 0.0.0.0:{}", port);
 
 	loop {
@@ -111,7 +120,7 @@ fn run_server(port: u16, base_dir: String) -> Result<(), Error> {
 					}
 				},
 				Token(client_id) => {
-					if let Err(_) = handle_client(&mut sessions, client_id, &event, &poll, base_dir.clone()) {
+					if let Err(_) = handle_client(&mut sessions, client_id, &event, &poll, base_dir.clone(), &mut caches) {
 						close_client(&mut sessions, client_id, &poll);
 					}
 				}
@@ -144,7 +153,7 @@ fn would_block(error: &Error) -> bool {
 	error.kind() == ErrorKind::WouldBlock
 }
 
-fn handle_client(sessions: &mut HashMap<usize, Session>, client_id: usize, event: &Event, poll: &Poll, base_dir: String) -> Result<(), Error> {
+fn handle_client(sessions: &mut HashMap<usize, Session>, client_id: usize, event: &Event, poll: &Poll, base_dir: String, caches: &mut HashMap<PathBuf, Cache>) -> Result<(), Error> {
 	if let Some(session) = sessions.get_mut(&client_id) {
 		if event.is_readable() {
 			let mut data = vec![0; REQUEST_SIZE];
@@ -182,7 +191,7 @@ fn handle_client(sessions: &mut HashMap<usize, Session>, client_id: usize, event
 			poll.registry()
 				.reregister(&mut session.client, Token(client_id), Interest::WRITABLE)?;
 
-			let response = handle_request(data, base_dir);
+			let response = handle_request(data, base_dir, caches);
 
 			session.response = Some(response);
 
@@ -205,11 +214,11 @@ fn handle_client(sessions: &mut HashMap<usize, Session>, client_id: usize, event
 	Ok(())
 }
 
-fn handle_request(data: Vec<u8>, base_dir: String) -> Vec<u8> {
+fn handle_request(data: Vec<u8>, base_dir: String, caches: &mut HashMap<PathBuf, Cache>) -> Vec<u8> {
 	let path = match parse_request(data) {
 		Ok(path) => path,
 		Err(_) => {
-			return build_response("400 Bad Request", HashMap::from([("Content-Type", "text/html")]), html_boilerplate("Something wen't wrong", "<h1>Bad Request</h1>"))
+			return build_response("400 Bad Request", HashMap::from([("Content-Type", "text/html")]), bad_request_html());
 		}
 	};
 
@@ -217,29 +226,60 @@ fn handle_request(data: Vec<u8>, base_dir: String) -> Vec<u8> {
 		Ok(full_path) => full_path,
 		Err(error) => {
 			if permission_denied(&error) {
-				return build_response("403 Forbidden", HashMap::from([("Content-Type", "text/html")]), html_boilerplate("Something wen't wrong", "<h1>Forbidden</h1>"))
+				return build_response("403 Forbidden", HashMap::from([("Content-Type", "text/html")]), forbidden_html());
 			}
 
 			if not_found(&error) {
-				return build_response("404 Not Found", HashMap::from([("Content-Type", "text/html")]), html_boilerplate("Something wen't wrong", "<h1>Not Found</h1>"))
+				return build_response("404 Not Found", HashMap::from([("Content-Type", "text/html")]), not_found_html())
 			}
 
-			return build_response("500 Internal Server Error", HashMap::from([("Content-Type", "text/html")]), html_boilerplate("Something wen't wrong", "<h1>Internal Server Error</h1>"))
+			return build_response("500 Internal Server Error", HashMap::from([("Content-Type", "text/html")]), internal_server_error_html())
 		}
 	};
 
-	let body = match get_content(full_path, path) {
-		Ok(body) => body,
+	match get_content_from_cache(caches, full_path.clone()) {
+		Ok(body) => {
+			if let Some(body) = body {
+				return build_response("200 OK", HashMap::new(), body);
+			}
+		},
 		Err(error) => {
 			if not_found(&error) {
-				return build_response("404 Not Found", HashMap::from([("Content-Type", "text/html")]), html_boilerplate("Something wen't wrong", "<h1>Not Found</h1>"))
+				return build_response("404 Not Found", HashMap::from([("Content-Type", "text/html")]), not_found_html())
 			}
 
-			return build_response("500 Internal Server Error", HashMap::from([("Content-Type", "text/html")]), html_boilerplate("Something wen't wrong", "<h1>Internal Server Error</h1>"))
+			return build_response("500 Internal Server Error", HashMap::from([("Content-Type", "text/html")]), internal_server_error_html())
 		}
 	};
 
-	build_response("200 OK", HashMap::new(), body)
+	let body = match get_content(full_path.clone(), path) {
+		Ok(body) => Arc::new(body),
+		Err(error) => {
+			if not_found(&error) {
+				return build_response("404 Not Found", HashMap::from([("Content-Type", "text/html")]), not_found_html());
+			}
+
+			return build_response("500 Internal Server Error", HashMap::from([("Content-Type", "text/html")]), internal_server_error_html());
+		}
+	};
+
+	match get_modified_timestamp(full_path.clone()) {
+		Ok(current_timestamp) => {
+			caches.insert(full_path, Cache {
+				content: Arc::clone(&body),
+				modified_timestamp: current_timestamp
+			});
+		},
+		Err(error) => {
+			if not_found(&error) {
+				return build_response("404 Not Found", HashMap::from([("Content-Type", "text/html")]), not_found_html());
+			}
+
+			return build_response("500 Internal Server Error", HashMap::from([("Content-Type", "text/html")]), internal_server_error_html())
+		}
+	};
+
+	build_response("200 OK", HashMap::new(), body.to_vec())
 }
 
 fn parse_request(data: Vec<u8>) -> Result<String, Error> {
@@ -269,8 +309,24 @@ fn parse_request(data: Vec<u8>) -> Result<String, Error> {
 	Ok(path)
 }
 
-fn html_boilerplate(title: &str, message: &str) -> Vec<u8> {
-	format!("<!DOCTYPE html>\n<html lang=\"en\">\n\t<head>\n\t\t<title>{}</title>\n\n\t\t<meta charset=\"UTF-8\"/>\n\t\t<meta name=\"robots\" content=\"noindex\"/>\n\t\t<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\"/>\n\t\t<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n\t</head>\n\t<body>\n\t\t<main>\n\t\t\t{}\n\t\t</main>\n\t</body>\n</html>", title, message).as_bytes().to_vec()
+fn bad_request_html() -> Vec<u8> {
+	html_boilerplate("Bad Request", "<h1>Bad Request</h1>")
+}
+
+fn forbidden_html() -> Vec<u8> {
+	html_boilerplate("Forbidden", "<h1>Forbidden</h1>")
+}
+
+fn not_found_html() -> Vec<u8> {
+	html_boilerplate("Not Found", "<h1>Not Found</h1>")
+}
+
+fn internal_server_error_html() -> Vec<u8> {
+	html_boilerplate("Internal Server Error", "<h1>Internal Server Error</h1>")
+}
+
+fn html_boilerplate(title: &str, content: &str) -> Vec<u8> {
+	format!("<!DOCTYPE html>\n<html lang=\"en\">\n\t<head>\n\t\t<title>{}</title>\n\n\t\t<meta charset=\"UTF-8\"/>\n\t\t<meta name=\"robots\" content=\"noindex\"/>\n\t\t<meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\"/>\n\t\t<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n\t</head>\n\t<body>\n\t\t<main>\n\t\t\t{}\n\t\t</main>\n\t</body>\n</html>", title, content).as_bytes().to_vec()
 }
 
 fn build_response(status: &str, headers: HashMap<&str, &str>, mut body: Vec<u8>) -> Vec<u8> {
@@ -322,6 +378,45 @@ fn permission_denied(error: &Error) -> bool {
 
 fn not_found(error: &Error) -> bool {
 	error.kind() == ErrorKind::NotFound
+}
+
+fn get_content_from_cache(caches: &mut HashMap<PathBuf, Cache>, full_path: PathBuf) -> Result<Option<Vec<u8>>, Error> {
+	let cache = match caches.get_mut(&full_path) {
+		Some(cache) => cache,
+		None => {
+			return Ok(None);
+		}
+	};
+
+	let current_timestamp = match get_modified_timestamp(full_path.clone()) {
+		Ok(current_timestamp) => current_timestamp,
+		Err(error) => {
+			if not_found(&error) {
+				caches.remove(&full_path);
+			}
+
+			return Err(error);
+		}
+	};
+
+	if cache.modified_timestamp != current_timestamp {
+		return Ok(None)
+	}
+
+	Ok(Some(cache.content.to_vec()))
+}
+
+fn get_modified_timestamp(full_path: PathBuf) -> Result<u64, Error> {
+	let metadata = fs::metadata(full_path)?;
+
+	let timestamp = match metadata.modified()?.duration_since(time::UNIX_EPOCH) {
+		Ok(timestamp) => timestamp.as_secs(),
+		Err(_) => {
+			return Err(Error::new(ErrorKind::Other, ""));
+		}
+	};
+
+	Ok(timestamp)
 }
 
 fn get_content(full_path: PathBuf, path: String) -> Result<Vec<u8>, Error> {
